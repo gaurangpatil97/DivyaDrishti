@@ -5,13 +5,11 @@ import {
   View,
   Dimensions,
   Platform,
-  ActivityIndicator,
   TouchableOpacity,
 } from 'react-native';
 
 import { CameraView, useCameraPermissions } from 'expo-camera';
 
-// --- Types ---
 interface BoundingBoxCoords {
   x1: number;
   y1: number;
@@ -33,15 +31,14 @@ interface ServerResponse {
   alerts: string[];
   objects: string[];
   detections: Detection[];
+  frameWidth: number;
+  frameHeight: number;
 }
 
 const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
-const CAPTURE_WIDTH = 720;
-const CAPTURE_HEIGHT = 1280;
-
 export default function Dashboard() {
-  const serverUrl = 'http://192.168.31.185:5000/detect'; // update IP
+  const serverUrl = 'http://192.168.31.185:5000/detect';
 
   const [permission, requestPermission] = useCameraPermissions();
 
@@ -49,10 +46,12 @@ export default function Dashboard() {
   const [alertText, setAlertText] = useState('Initializing...');
   const [isCameraReady, setIsCameraReady] = useState(false);
 
+  const [serverW, setServerW] = useState(1);
+  const [serverH, setServerH] = useState(1);
+
   const cameraRef = useRef<CameraView>(null);
   const runningRef = useRef(false);
 
-  // --------------- START REALTIME LOOP (NO INTERVAL) ----------------
   useEffect(() => {
     if (isCameraReady && !runningRef.current) {
       runningRef.current = true;
@@ -61,19 +60,15 @@ export default function Dashboard() {
   }, [isCameraReady]);
 
   const startRealtimeLoop = async () => {
-    console.log('🔄 Starting real-time capture loop...');
     while (runningRef.current) {
       await captureAndSendFrame();
     }
   };
 
-  // --------------- STOP BUTTON ----------------
   const stopRealtime = () => {
     runningRef.current = false;
-    console.log('⛔ Real-time loop stopped');
   };
 
-  // --------------- CAPTURE + SEND ----------------
   const captureAndSendFrame = async () => {
     if (!cameraRef.current) return;
 
@@ -93,13 +88,14 @@ export default function Dashboard() {
 
       const response = await fetch(serverUrl, {
         method: 'POST',
-        body: formData,
-        headers: { 'Content-Type': 'multipart/form-data' },
+        body: formData
       });
 
       const data: ServerResponse = await response.json();
 
       setDetections(data.detections || []);
+      setServerW(data.frameWidth);
+      setServerH(data.frameHeight);
 
       if (data.alert) {
         setAlertText(data.alert);
@@ -108,12 +104,12 @@ export default function Dashboard() {
       } else {
         setAlertText('Path Clear');
       }
+
     } catch (err) {
       console.log('Error sending frame:', err);
     }
   };
 
-  // --------------- PERMISSION SCREEN ----------------
   if (!permission?.granted) {
     return (
       <View style={styles.permissionContainer}>
@@ -125,6 +121,9 @@ export default function Dashboard() {
     );
   }
 
+  const scaleX = SCREEN_WIDTH / serverW;
+  const scaleY = SCREEN_HEIGHT / serverH;
+
   return (
     <View style={styles.container}>
       <CameraView
@@ -135,12 +134,16 @@ export default function Dashboard() {
       >
         <View style={styles.overlay}>
           {detections.map((det, i) => (
-            <BoundingBox key={`${det.class}-${i}`} detection={det} />
+            <BoundingBox
+              key={`${det.class}-${i}`}
+              detection={det}
+              scaleX={scaleX}
+              scaleY={scaleY}
+            />
           ))}
         </View>
       </CameraView>
 
-      {/* STOP BUTTON */}
       <TouchableOpacity style={styles.stopButton} onPress={stopRealtime}>
         <Text style={styles.stopButtonText}>STOP</Text>
       </TouchableOpacity>
@@ -161,12 +164,16 @@ export default function Dashboard() {
   );
 }
 
-// ---------- Bounding Box Component ----------
-function BoundingBox({ detection }: { detection: Detection }) {
+function BoundingBox({
+  detection,
+  scaleX,
+  scaleY
+}: {
+  detection: Detection;
+  scaleX: number;
+  scaleY: number;
+}) {
   const { bbox, class: className, isPriority, distance } = detection;
-
-  const scaleX = SCREEN_WIDTH / CAPTURE_WIDTH;
-  const scaleY = SCREEN_HEIGHT / CAPTURE_HEIGHT;
 
   return (
     <View
@@ -195,7 +202,6 @@ function BoundingBox({ detection }: { detection: Detection }) {
   );
 }
 
-// ---------- Styles ----------
 const styles = StyleSheet.create({
   container: { flex: 1, backgroundColor: 'black' },
 

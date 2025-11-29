@@ -18,8 +18,7 @@ PRIORITY_OBJECTS = {
     'person', 'car', 'bicycle', 'motorcycle', 'bus', 'truck', 'dog'
 }
 
-# Global dictionary to track when an object was last "announced"
-# key: class_name, value: timestamp
+# Global dictionary for cooldown
 last_announcement_time = defaultdict(float)
 
 print(f"🔄 Loading YOLO model: {MODEL_FILE}...")
@@ -30,22 +29,17 @@ except Exception as e:
     print(f"❌ Error loading model: {e}")
     model = None
 
+
 def should_announce(class_name):
-    """
-    Checks if enough time has passed since the last alert for this object.
-    """
     current_time = time.time()
     if current_time - last_announcement_time[class_name] >= COOLDOWN_TIME:
         last_announcement_time[class_name] = current_time
         return True
     return False
 
+
 @app.route('/detect', methods=['POST'])
 def detect_object():
-    """
-    Detect objects and return results. 
-    INCLUDES: Logic to prevent repetitive alerts (Cooldowns).
-    """
     if not model:
         return jsonify({"error": "Model not loaded"}), 500
 
@@ -53,24 +47,30 @@ def detect_object():
         return jsonify({"error": "No image sent"}), 400
 
     try:
-        # 1. Read Image
         file = request.files['image']
+
+        # 1. Load image
         img = Image.open(io.BytesIO(file.read())).convert('RGB')
 
-        # 2. Run Inference
+        # 🔥 🔥 🔥 ROTATE TO PORTRAIT MODE 🔥 🔥 🔥
+        # Rotate 90 degrees clockwise
+        img = img.rotate(-90, expand=True)
+        img_width, img_height = img.size
+
+        print("SERVER FRAME SIZE (rotated):", img.size)
+
+        # 2. YOLO Detection
         results = model.predict(source=img, save=False, verbose=False, conf=0.5)
         result = results[0]
 
-        img_width, img_height = img.size
         frame_area = img_width * img_height
         frame_center_x = img_width / 2
         center_threshold = img_width * 0.2
 
         detections = []
-        alerts = []          # High priority alerts (with cooldown applied)
-        detected_items = []  # Raw list of everything seen
+        alerts = []
+        detected_items = []
 
-        # 3. Parse detections
         if result.boxes is not None and len(result.boxes) > 0:
             boxes = result.boxes.xyxy.cpu().numpy()
             confidences = result.boxes.conf.cpu().numpy()
@@ -84,10 +84,8 @@ def detect_object():
                 class_name = model.names[int(class_id)]
                 detected_items.append(class_name)
 
-                # --- Priority Check ---
                 is_priority = class_name in PRIORITY_OBJECTS
 
-                # --- Position Logic ---
                 object_center_x = (x1 + x2) / 2
                 position_str = "in front"
                 if object_center_x < frame_center_x - center_threshold:
@@ -95,7 +93,6 @@ def detect_object():
                 elif object_center_x > frame_center_x + center_threshold:
                     position_str = "to the right"
 
-                # --- Distance Logic ---
                 box_area = (x2 - x1) * (y2 - y1)
                 area_ratio = box_area / frame_area
                 distance_str = "far away"
@@ -104,15 +101,9 @@ def detect_object():
                 elif area_ratio > 0.05:
                     distance_str = "at a medium distance"
 
-                # --- Cooldown & Alert Generation ---
-                # We only generate an alert text if:
-                # 1. It is a priority object
-                # 2. The cooldown timer has expired for this object type
-                if is_priority:
-                    if should_announce(class_name):
-                        alerts.append(f"Warning! {class_name} {distance_str} {position_str}")
-                
-                # Add to structured list (for drawing boxes on the phone)
+                if is_priority and should_announce(class_name):
+                    alerts.append(f"Warning! {class_name} {distance_str} {position_str}")
+
                 detections.append({
                     "class": class_name,
                     "confidence": float(conf),
@@ -122,28 +113,26 @@ def detect_object():
                     "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
                 })
 
-        # 4. Compose Primary Response
-        # The 'alert' field is what the phone uses to Speak. 
-        # If 'alerts' is empty (due to cooldown), the phone stays silent.
         if alerts:
-            alert_message = alerts[0] # Take the first high-priority alert
+            alert_message = alerts[0]
         elif not detected_items:
-            alert_message = "" # Silence if nothing is there
+            alert_message = ""
         else:
-            # Optional: If you want it to speak non-priority items occasionally, add logic here.
-            # For now, we leave it blank to reduce noise, or set generic status.
-            alert_message = "" 
+            alert_message = ""
 
         return jsonify({
-            "alert": alert_message,   # TTS text (Empty if cooldown is active)
-            "alerts": alerts,         # List of urgent alerts
-            "objects": detected_items,# List of all objects found
-            "detections": detections  # Full data for UI drawing
+            "alert": alert_message,
+            "alerts": alerts,
+            "objects": detected_items,
+            "detections": detections,
+            "frameWidth": img_width,
+            "frameHeight": img_height
         })
 
     except Exception as e:
         print(f"Error: {e}")
         return jsonify({"error": str(e)}), 500
+
 
 if __name__ == '__main__':
     print("🚀 Server running on port 5000...")

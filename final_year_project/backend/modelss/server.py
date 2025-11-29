@@ -1,139 +1,301 @@
 import io
 import time
+import logging
 from collections import defaultdict
+from datetime import datetime
 from flask import Flask, request, jsonify
 from flask_cors import CORS
 from ultralytics import YOLO
 from PIL import Image
+import torch
+import numpy as np
 
+# Initialize Flask app
 app = Flask(__name__)
 CORS(app)
 
-# --- CONFIGURATION ---
-MODEL_FILE = 'yolov8n.pt'
-COOLDOWN_TIME = 3.0  # Seconds to wait before repeating the same alert
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# Priority objects for safety alerts
-PRIORITY_OBJECTS = {
-    'person', 'car', 'bicycle', 'motorcycle', 'bus', 'truck', 'dog'
-}
+# ==================== CONFIGURATION ====================
+class Config:
+    MODEL_FILE = 'yolov8n.pt'
+    COOLDOWN_TIME = 3.0  # Seconds between same alerts
+    CONFIDENCE_THRESHOLD = 0.5
+    
+    # Priority objects for safety alerts
+    PRIORITY_OBJECTS = {
+        'person', 'car', 'bicycle', 'motorcycle', 'bus', 'truck', 
+        'dog', 'cat', 'traffic light', 'stop sign'
+    }
+    
+    # Distance thresholds (by area ratio)
+    DISTANCE_CLOSE = 0.15
+    DISTANCE_MEDIUM = 0.05
+    
+    # Position threshold (percentage of frame width)
+    CENTER_THRESHOLD = 0.2
 
-# Global dictionary for cooldown
+config = Config()
+
+# ==================== GLOBAL STATE ====================
 last_announcement_time = defaultdict(float)
+frame_count = 0
+model = None
 
-print(f"🔄 Loading YOLO model: {MODEL_FILE}...")
-try:
-    model = YOLO(MODEL_FILE)
-    print("✅ Model loaded successfully!")
-except Exception as e:
-    print(f"❌ Error loading model: {e}")
-    model = None
+# ==================== MODEL INITIALIZATION ====================
+def initialize_model():
+    """Initialize YOLO model with GPU support if available."""
+    global model
+    
+    logger.info(f"🔄 Loading YOLO model: {config.MODEL_FILE}...")
+    
+    try:
+        model = YOLO(config.MODEL_FILE)
+        
+        # Use GPU if available
+        if torch.cuda.is_available():
+            device = 'cuda'
+            logger.info(f"✅ GPU detected: {torch.cuda.get_device_name(0)}")
+        else:
+            device = 'cpu'
+            logger.info("ℹ️  Running on CPU")
+        
+        model.to(device)
+        logger.info(f"✅ Model loaded successfully on {device}!")
+        
+        return True
+        
+    except Exception as e:
+        logger.error(f"❌ Error loading model: {e}")
+        return False
 
-
-def should_announce(class_name):
+# ==================== HELPER FUNCTIONS ====================
+def should_announce(class_name: str) -> bool:
+    """Check if enough time has passed to announce this object again."""
     current_time = time.time()
-    if current_time - last_announcement_time[class_name] >= COOLDOWN_TIME:
+    if current_time - last_announcement_time[class_name] >= config.COOLDOWN_TIME:
         last_announcement_time[class_name] = current_time
         return True
     return False
 
+def calculate_position(x1: float, x2: float, frame_width: int) -> str:
+    """Determine object position relative to frame center."""
+    object_center_x = (x1 + x2) / 2
+    frame_center_x = frame_width / 2
+    center_threshold = frame_width * config.CENTER_THRESHOLD
+    
+    if object_center_x < frame_center_x - center_threshold:
+        return "to the left"
+    elif object_center_x > frame_center_x + center_threshold:
+        return "to the right"
+    else:
+        return "in front"
+
+def calculate_distance(box_area: float, frame_area: float) -> str:
+    """Estimate distance based on object size in frame."""
+    area_ratio = box_area / frame_area
+    
+    if area_ratio > config.DISTANCE_CLOSE:
+        return "close"
+    elif area_ratio > config.DISTANCE_MEDIUM:
+        return "at medium distance"
+    else:
+        return "far away"
+
+def process_image(image_file) -> Image.Image:
+    """Process uploaded image with rotation."""
+    try:
+        # Load image
+        img = Image.open(io.BytesIO(image_file.read())).convert('RGB')
+        
+        # Rotate 90 degrees clockwise for portrait mode
+        img = img.rotate(-90, expand=True)
+        
+        logger.info(f"📐 Image processed: {img.size}")
+        return img
+        
+    except Exception as e:
+        logger.error(f"Error processing image: {e}")
+        raise
+
+def run_detection(img: Image.Image) -> dict:
+    """Run YOLO detection on image and return structured results."""
+    global frame_count
+    frame_count += 1
+    
+    img_width, img_height = img.size
+    frame_area = img_width * img_height
+    
+    # Run YOLO inference
+    results = model.predict(
+        source=img, 
+        save=False, 
+        verbose=False, 
+        conf=config.CONFIDENCE_THRESHOLD
+    )
+    result = results[0]
+    
+    detections = []
+    alerts = []
+    detected_items = []
+    
+    # Process detections
+    if result.boxes is not None and len(result.boxes) > 0:
+        boxes = result.boxes.xyxy.cpu().numpy()
+        confidences = result.boxes.conf.cpu().numpy()
+        class_ids = result.boxes.cls.cpu().numpy()
+        
+        for box, conf, class_id in zip(boxes, confidences, class_ids):
+            if float(conf) < config.CONFIDENCE_THRESHOLD:
+                continue
+            
+            x1, y1, x2, y2 = map(int, box)
+            class_name = model.names[int(class_id)]
+            detected_items.append(class_name)
+            
+            is_priority = class_name in config.PRIORITY_OBJECTS
+            
+            # Calculate position
+            position_str = calculate_position(x1, x2, img_width)
+            
+            # Calculate distance
+            box_area = (x2 - x1) * (y2 - y1)
+            distance_str = calculate_distance(box_area, frame_area)
+            
+            # Generate alert for priority objects
+            if is_priority and should_announce(class_name):
+                alert_msg = f"Warning! {class_name} {distance_str} {position_str}"
+                alerts.append(alert_msg)
+                logger.info(f"🚨 {alert_msg}")
+            
+            # Add to detections
+            detections.append({
+                "class": class_name,
+                "confidence": float(conf),
+                "position": position_str,
+                "distance": distance_str,
+                "isPriority": is_priority,
+                "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
+            })
+    
+    # Prepare response
+    alert_message = alerts[0] if alerts else ""
+    
+    logger.info(f"✅ Frame {frame_count}: {len(detections)} objects detected")
+    
+    return {
+        "alert": alert_message,
+        "alerts": alerts,
+        "objects": detected_items,
+        "detections": detections,
+        "frameWidth": img_width,
+        "frameHeight": img_height,
+        "frameCount": frame_count,
+        "timestamp": datetime.now().isoformat()
+    }
+
+# ==================== API ENDPOINTS ====================
+@app.route('/health', methods=['GET'])
+def health_check():
+    """Health check endpoint."""
+    return jsonify({
+        "status": "healthy",
+        "model_loaded": model is not None,
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "frames_processed": frame_count
+    })
 
 @app.route('/detect', methods=['POST'])
 def detect_object():
+    """Main detection endpoint."""
     if not model:
+        logger.error("Model not loaded")
         return jsonify({"error": "Model not loaded"}), 500
-
+    
     if 'image' not in request.files:
+        logger.warning("No image in request")
         return jsonify({"error": "No image sent"}), 400
-
+    
     try:
         file = request.files['image']
-
-        # 1. Load image
-        img = Image.open(io.BytesIO(file.read())).convert('RGB')
-
-        # 🔥 🔥 🔥 ROTATE TO PORTRAIT MODE 🔥 🔥 🔥
-        # Rotate 90 degrees clockwise
-        img = img.rotate(-90, expand=True)
-        img_width, img_height = img.size
-
-        print("SERVER FRAME SIZE (rotated):", img.size)
-
-        # 2. YOLO Detection
-        results = model.predict(source=img, save=False, verbose=False, conf=0.5)
-        result = results[0]
-
-        frame_area = img_width * img_height
-        frame_center_x = img_width / 2
-        center_threshold = img_width * 0.2
-
-        detections = []
-        alerts = []
-        detected_items = []
-
-        if result.boxes is not None and len(result.boxes) > 0:
-            boxes = result.boxes.xyxy.cpu().numpy()
-            confidences = result.boxes.conf.cpu().numpy()
-            class_ids = result.boxes.cls.cpu().numpy()
-
-            for box, conf, class_id in zip(boxes, confidences, class_ids):
-                if float(conf) < 0.5:
-                    continue
-
-                x1, y1, x2, y2 = map(int, box)
-                class_name = model.names[int(class_id)]
-                detected_items.append(class_name)
-
-                is_priority = class_name in PRIORITY_OBJECTS
-
-                object_center_x = (x1 + x2) / 2
-                position_str = "in front"
-                if object_center_x < frame_center_x - center_threshold:
-                    position_str = "to the left"
-                elif object_center_x > frame_center_x + center_threshold:
-                    position_str = "to the right"
-
-                box_area = (x2 - x1) * (y2 - y1)
-                area_ratio = box_area / frame_area
-                distance_str = "far away"
-                if area_ratio > 0.15:
-                    distance_str = "close"
-                elif area_ratio > 0.05:
-                    distance_str = "at a medium distance"
-
-                if is_priority and should_announce(class_name):
-                    alerts.append(f"Warning! {class_name} {distance_str} {position_str}")
-
-                detections.append({
-                    "class": class_name,
-                    "confidence": float(conf),
-                    "position": position_str,
-                    "distance": distance_str,
-                    "isPriority": is_priority,
-                    "bbox": {"x1": x1, "y1": y1, "x2": x2, "y2": y2}
-                })
-
-        if alerts:
-            alert_message = alerts[0]
-        elif not detected_items:
-            alert_message = ""
-        else:
-            alert_message = ""
-
-        return jsonify({
-            "alert": alert_message,
-            "alerts": alerts,
-            "objects": detected_items,
-            "detections": detections,
-            "frameWidth": img_width,
-            "frameHeight": img_height
-        })
-
+        
+        # Process image
+        img = process_image(file)
+        
+        # Run detection
+        result = run_detection(img)
+        
+        return jsonify(result)
+        
     except Exception as e:
-        print(f"Error: {e}")
+        logger.error(f"❌ Detection error: {e}", exc_info=True)
         return jsonify({"error": str(e)}), 500
 
+@app.route('/reset', methods=['POST'])
+def reset_cooldowns():
+    """Reset announcement cooldowns."""
+    global last_announcement_time
+    last_announcement_time.clear()
+    logger.info("🔄 Cooldowns reset")
+    return jsonify({"message": "Cooldowns reset"})
 
+@app.route('/stats', methods=['GET'])
+def get_stats():
+    """Get server statistics."""
+    return jsonify({
+        "frames_processed": frame_count,
+        "model": config.MODEL_FILE,
+        "device": "cuda" if torch.cuda.is_available() else "cpu",
+        "confidence_threshold": config.CONFIDENCE_THRESHOLD,
+        "priority_objects": list(config.PRIORITY_OBJECTS)
+    })
+
+# ==================== ERROR HANDLERS ====================
+@app.errorhandler(404)
+def not_found(error):
+    return jsonify({"error": "Endpoint not found"}), 404
+
+@app.errorhandler(500)
+def internal_error(error):
+    logger.error(f"Internal server error: {error}")
+    return jsonify({"error": "Internal server error"}), 500
+
+# ==================== STARTUP ====================
 if __name__ == '__main__':
-    print("🚀 Server running on port 5000...")
-    app.run(host='0.0.0.0', port=5000)
+    print("\n" + "="*50)
+    print("🚀 VISUAL ASSISTANCE DETECTION SERVER")
+    print("="*50 + "\n")
+    
+    # Initialize model
+    if not initialize_model():
+        print("❌ Failed to initialize model. Exiting.")
+        exit(1)
+    
+    print("\n" + "="*50)
+    print("📡 Server Configuration:")
+    print(f"   • Host: 0.0.0.0")
+    print(f"   • Port: 5000")
+    print(f"   • Model: {config.MODEL_FILE}")
+    print(f"   • Device: {'GPU' if torch.cuda.is_available() else 'CPU'}")
+    print(f"   • Confidence: {config.CONFIDENCE_THRESHOLD}")
+    print("="*50 + "\n")
+    
+    print("🎯 Available endpoints:")
+    print("   • POST /detect     - Object detection")
+    print("   • GET  /health     - Health check")
+    print("   • GET  /stats      - Statistics")
+    print("   • POST /reset      - Reset cooldowns")
+    print("\n" + "="*50 + "\n")
+    
+    # Run server
+    app.run(
+        host='0.0.0.0', 
+        port=5000, 
+        debug=False,
+        threaded=True
+    )

@@ -23,14 +23,16 @@ logger = logging.getLogger(__name__)
 
 # ==================== CONFIGURATION ====================
 class Config:
-    MODEL_FILE = 'yolov8n.pt'
+    MODEL_FILE = 'yolo11n.pt'  # YOLOv11 Nano model
     COOLDOWN_TIME = 3.0  # Seconds between same alerts
     CONFIDENCE_THRESHOLD = 0.5
     
     # Priority objects for safety alerts
     PRIORITY_OBJECTS = {
         'person', 'car', 'bicycle', 'motorcycle', 'bus', 'truck', 
-        'dog', 'cat', 'traffic light', 'stop sign'
+        'dog', 'cat', 'traffic light', 'stop sign', 'fire hydrant',
+        'parking meter', 'bench', 'bird', 'horse', 'sheep', 'cow',
+        'elephant', 'bear', 'zebra', 'giraffe'
     }
     
     # Distance thresholds (by area ratio)
@@ -55,23 +57,35 @@ def initialize_model():
     logger.info(f"🔄 Loading YOLO model: {config.MODEL_FILE}...")
     
     try:
+        # Initialize YOLOv11 model (will auto-download on first run)
         model = YOLO(config.MODEL_FILE)
         
-        # Use GPU if available
+        # Check if GPU is available
         if torch.cuda.is_available():
             device = 'cuda'
-            logger.info(f"✅ GPU detected: {torch.cuda.get_device_name(0)}")
+            gpu_name = torch.cuda.get_device_name(0)
+            gpu_memory = torch.cuda.get_device_properties(0).total_memory / 1024**3
+            logger.info(f"✅ GPU detected: {gpu_name}")
+            logger.info(f"💾 GPU Memory: {gpu_memory:.2f} GB")
         else:
             device = 'cpu'
-            logger.info("ℹ️  Running on CPU")
+            logger.info("ℹ️  Running on CPU (GPU not available)")
         
+        # Move model to device
         model.to(device)
-        logger.info(f"✅ Model loaded successfully on {device}!")
+        
+        # Verify model is loaded
+        if hasattr(model, 'names'):
+            num_classes = len(model.names)
+            logger.info(f"📦 Model classes: {num_classes}")
+        
+        logger.info(f"✅ YOLOv11 model loaded successfully on {device.upper()}!")
         
         return True
         
     except Exception as e:
         logger.error(f"❌ Error loading model: {e}")
+        logger.error("💡 Tip: Run 'pip install --upgrade ultralytics' to ensure YOLOv11 support")
         return False
 
 # ==================== HELPER FUNCTIONS ====================
@@ -114,9 +128,10 @@ def process_image(image_file) -> Image.Image:
         img = Image.open(io.BytesIO(image_file.read())).convert('RGB')
         
         # Rotate 90 degrees clockwise for portrait mode
+        # (Keep this if your mobile app sends images in landscape)
         img = img.rotate(-90, expand=True)
         
-        logger.info(f"📐 Image processed: {img.size}")
+        logger.info(f"📐 Image processed: {img.size[0]}x{img.size[1]}")
         return img
         
     except Exception as e:
@@ -131,13 +146,17 @@ def run_detection(img: Image.Image) -> dict:
     img_width, img_height = img.size
     frame_area = img_width * img_height
     
-    # Run YOLO inference
+    # Run YOLOv11 inference
+    start_time = time.time()
     results = model.predict(
         source=img, 
         save=False, 
         verbose=False, 
-        conf=config.CONFIDENCE_THRESHOLD
+        conf=config.CONFIDENCE_THRESHOLD,
+        device='cuda' if torch.cuda.is_available() else 'cpu'
     )
+    inference_time = (time.time() - start_time) * 1000  # Convert to ms
+    
     result = results[0]
     
     detections = []
@@ -186,7 +205,10 @@ def run_detection(img: Image.Image) -> dict:
     # Prepare response
     alert_message = alerts[0] if alerts else ""
     
-    logger.info(f"✅ Frame {frame_count}: {len(detections)} objects detected")
+    logger.info(
+        f"✅ Frame {frame_count}: {len(detections)} objects detected "
+        f"({inference_time:.1f}ms)"
+    )
     
     return {
         "alert": alert_message,
@@ -196,6 +218,7 @@ def run_detection(img: Image.Image) -> dict:
         "frameWidth": img_width,
         "frameHeight": img_height,
         "frameCount": frame_count,
+        "inferenceTime": round(inference_time, 2),
         "timestamp": datetime.now().isoformat()
     }
 
@@ -206,8 +229,11 @@ def health_check():
     return jsonify({
         "status": "healthy",
         "model_loaded": model is not None,
+        "model_version": config.MODEL_FILE,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
-        "frames_processed": frame_count
+        "frames_processed": frame_count,
+        "confidence_threshold": config.CONFIDENCE_THRESHOLD,
+        "server_time": datetime.now().isoformat()
     })
 
 @app.route('/detect', methods=['POST'])
@@ -223,6 +249,10 @@ def detect_object():
     
     try:
         file = request.files['image']
+        
+        # Validate file
+        if file.filename == '':
+            return jsonify({"error": "Empty filename"}), 400
         
         # Process image
         img = process_image(file)
@@ -242,60 +272,132 @@ def reset_cooldowns():
     global last_announcement_time
     last_announcement_time.clear()
     logger.info("🔄 Cooldowns reset")
-    return jsonify({"message": "Cooldowns reset"})
+    return jsonify({
+        "message": "Cooldowns reset successfully",
+        "timestamp": datetime.now().isoformat()
+    })
 
 @app.route('/stats', methods=['GET'])
 def get_stats():
     """Get server statistics."""
+    gpu_info = {}
+    if torch.cuda.is_available():
+        gpu_info = {
+            "gpu_name": torch.cuda.get_device_name(0),
+            "gpu_memory_allocated": f"{torch.cuda.memory_allocated(0) / 1024**2:.2f} MB",
+            "gpu_memory_total": f"{torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB"
+        }
+    
     return jsonify({
         "frames_processed": frame_count,
         "model": config.MODEL_FILE,
         "device": "cuda" if torch.cuda.is_available() else "cpu",
         "confidence_threshold": config.CONFIDENCE_THRESHOLD,
-        "priority_objects": list(config.PRIORITY_OBJECTS)
+        "priority_objects": sorted(list(config.PRIORITY_OBJECTS)),
+        "cooldown_time": config.COOLDOWN_TIME,
+        "gpu_info": gpu_info,
+        "server_uptime": datetime.now().isoformat()
+    })
+
+@app.route('/config', methods=['GET'])
+def get_config():
+    """Get current configuration."""
+    return jsonify({
+        "model_file": config.MODEL_FILE,
+        "confidence_threshold": config.CONFIDENCE_THRESHOLD,
+        "cooldown_time": config.COOLDOWN_TIME,
+        "distance_close": config.DISTANCE_CLOSE,
+        "distance_medium": config.DISTANCE_MEDIUM,
+        "center_threshold": config.CENTER_THRESHOLD,
+        "priority_objects_count": len(config.PRIORITY_OBJECTS)
+    })
+
+@app.route('/classes', methods=['GET'])
+def get_classes():
+    """Get all detectable classes."""
+    if not model:
+        return jsonify({"error": "Model not loaded"}), 500
+    
+    return jsonify({
+        "classes": model.names,
+        "total_classes": len(model.names),
+        "priority_classes": sorted(list(config.PRIORITY_OBJECTS))
     })
 
 # ==================== ERROR HANDLERS ====================
 @app.errorhandler(404)
 def not_found(error):
-    return jsonify({"error": "Endpoint not found"}), 404
+    return jsonify({
+        "error": "Endpoint not found",
+        "available_endpoints": [
+            "POST /detect",
+            "GET /health",
+            "GET /stats",
+            "GET /config",
+            "GET /classes",
+            "POST /reset"
+        ]
+    }), 404
 
 @app.errorhandler(500)
 def internal_error(error):
     logger.error(f"Internal server error: {error}")
     return jsonify({"error": "Internal server error"}), 500
 
+@app.errorhandler(413)
+def request_entity_too_large(error):
+    return jsonify({"error": "File too large"}), 413
+
 # ==================== STARTUP ====================
 if __name__ == '__main__':
-    print("\n" + "="*50)
+    print("\n" + "="*60)
     print("🚀 VISUAL ASSISTANCE DETECTION SERVER")
-    print("="*50 + "\n")
+    print("🤖 Powered by YOLOv11 Nano")
+    print("="*60 + "\n")
     
     # Initialize model
     if not initialize_model():
-        print("❌ Failed to initialize model. Exiting.")
+        print("\n❌ Failed to initialize model. Exiting.")
+        print("💡 Troubleshooting:")
+        print("   1. Ensure 'ultralytics' is installed: pip install ultralytics")
+        print("   2. Update to latest version: pip install --upgrade ultralytics")
+        print("   3. Check internet connection (model will download on first run)")
+        print("   4. Check PyTorch installation: pip install torch torchvision")
         exit(1)
     
-    print("\n" + "="*50)
+    print("\n" + "="*60)
     print("📡 Server Configuration:")
     print(f"   • Host: 0.0.0.0")
     print(f"   • Port: 5000")
     print(f"   • Model: {config.MODEL_FILE}")
-    print(f"   • Device: {'GPU' if torch.cuda.is_available() else 'CPU'}")
-    print(f"   • Confidence: {config.CONFIDENCE_THRESHOLD}")
-    print("="*50 + "\n")
+    print(f"   • Device: {'GPU (CUDA)' if torch.cuda.is_available() else 'CPU'}")
+    print(f"   • Confidence Threshold: {config.CONFIDENCE_THRESHOLD}")
+    print(f"   • Priority Objects: {len(config.PRIORITY_OBJECTS)}")
+    print(f"   • Alert Cooldown: {config.COOLDOWN_TIME}s")
+    print("="*60 + "\n")
     
-    print("🎯 Available endpoints:")
-    print("   • POST /detect     - Object detection")
+    print("🎯 Available Endpoints:")
+    print("   • POST /detect     - Object detection (main endpoint)")
     print("   • GET  /health     - Health check")
-    print("   • GET  /stats      - Statistics")
-    print("   • POST /reset      - Reset cooldowns")
-    print("\n" + "="*50 + "\n")
+    print("   • GET  /stats      - Server statistics")
+    print("   • GET  /config     - Current configuration")
+    print("   • GET  /classes    - All detectable classes")
+    print("   • POST /reset      - Reset alert cooldowns")
+    print("\n" + "="*60 + "\n")
+    
+    print("✨ Ready to process frames!")
+    print("🔗 Test with: curl http://localhost:5000/health\n")
     
     # Run server
-    app.run(
-        host='0.0.0.0', 
-        port=5000, 
-        debug=False,
-        threaded=True
-    )
+    try:
+        app.run(
+            host='0.0.0.0', 
+            port=5000, 
+            debug=False,
+            threaded=True
+        )
+    except KeyboardInterrupt:
+        print("\n\n👋 Server stopped gracefully")
+    except Exception as e:
+        logger.error(f"❌ Server error: {e}")
+        print(f"\n❌ Server failed to start: {e}")

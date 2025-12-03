@@ -1,4 +1,11 @@
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  memo,
+  useMemo,
+} from 'react';
 import {
   StyleSheet,
   Text,
@@ -8,9 +15,13 @@ import {
   TouchableOpacity,
   Alert,
   Vibration,
+  FlatList,
+  StatusBar,
+  SafeAreaView,
 } from 'react-native';
 import { CameraView, useCameraPermissions } from 'expo-camera';
 import * as Speech from 'expo-speech';
+import { Feather } from '@expo/vector-icons';
 
 interface BoundingBoxCoords {
   x1: number;
@@ -41,111 +52,168 @@ const { width: SCREEN_WIDTH, height: SCREEN_HEIGHT } = Dimensions.get('window');
 
 // Configuration
 const CONFIG = {
-  SERVER_URL: 'http://192.168.31.185:5000/detect',
-  FRAME_RATE: 3, // FPS
-  REQUEST_TIMEOUT: 5000, // ms
-  RECONNECT_DELAY: 2000, // ms
-  IMAGE_QUALITY: 0.4,
-  MAX_RETRY_ATTEMPTS: 3,
-  SPEECH_COOLDOWN: 3000, // ms between speech announcements
+  SERVER_URL: 'http://192.168.29.172:5000/detect',
+  FRAME_RATE: 10,
+  REQUEST_TIMEOUT: 5000,
+  RECONNECT_DELAY: 1000,
+  IMAGE_QUALITY: 0.15,
+  MAX_RETRY_ATTEMPTS: 5,
+  SPEECH_COOLDOWN: 3000,
+};
+
+// UI Colors
+const COLORS = {
+  bg: '#0A0E1A',
+  card: '#1A1F2E',
+  primary: '#3B82F6',
+  success: '#10B981',
+  warning: '#F59E0B',
+  danger: '#EF4444',
+  textMain: '#F9FAFB',
+  textSub: '#9CA3AF',
+  border: '#252A3A',
+  overlay: 'rgba(0, 0, 0, 0.5)',
 };
 
 export default function Dashboard() {
   const [permission, requestPermission] = useCameraPermissions();
-  
   const [detections, setDetections] = useState<Detection[]>([]);
-  const [alertText, setAlertText] = useState('Initializing...');
+  const [alertText, setAlertText] = useState('System Ready');
   const [isCameraReady, setIsCameraReady] = useState(false);
   const [isRunning, setIsRunning] = useState(false);
-  const [connectionStatus, setConnectionStatus] = useState<'connecting' | 'connected' | 'error'>('connecting');
-  const [frameCount, setFrameCount] = useState(0);
-  
+  const [connectionStatus, setConnectionStatus] = useState<
+    'connecting' | 'connected' | 'error'
+  >('connecting');
   const [serverW, setServerW] = useState(1);
   const [serverH, setServerH] = useState(1);
 
   const cameraRef = useRef<CameraView>(null);
+
   const runningRef = useRef(false);
   const processingRef = useRef(false);
   const lastSpeechTimeRef = useRef(0);
   const retryCountRef = useRef(0);
   const mountedRef = useRef(true);
+  const frameLoopTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const lastAlertTextRef = useRef<string>('System Ready');
+  
+  // Set initial camera layout based on the flex ratio (3/4 or 75%)
+  const [cameraLayout, setCameraLayout] = useState<{ w: number; h: number }>({
+    w: SCREEN_WIDTH,
+    h: Math.round(SCREEN_HEIGHT * 0.75), 
+  });
 
-  // Cleanup on unmount
+  // ---------- helpers ----------
+
+  const updateDetections = useCallback((next: Detection[]) => {
+    setDetections(prev => {
+      if (prev.length === next.length) {
+        let same = true;
+        for (let i = 0; i < prev.length; i++) {
+          const a = prev[i];
+          const b = next[i];
+          if (
+            a.class !== b.class ||
+            a.bbox.x1 !== b.bbox.x1 ||
+            a.bbox.y1 !== b.bbox.y1 ||
+            a.bbox.x2 !== b.bbox.x2 ||
+            a.bbox.y2 !== b.bbox.y2
+          ) {
+            same = false;
+            break;
+          }
+        }
+        if (same) return prev;
+      }
+      return next;
+    });
+  }, []);
+
+  const speakAlert = useCallback((text: string) => {
+    const now = Date.now();
+    if (now - lastSpeechTimeRef.current < CONFIG.SPEECH_COOLDOWN) {
+      return;
+    }
+    lastSpeechTimeRef.current = now;
+    Speech.stop();
+    Speech.speak(text, {
+      language: 'en-US',
+      pitch: 1.0,
+      rate: 1.05,
+    });
+  }, []);
+
+  const handleAlerts = useCallback(
+    (data: ServerResponse) => {
+      let nextAlert = 'Path Clear';
+      if (data.alert) {
+        nextAlert = data.alert;
+      } else if (data.objects?.length > 0) {
+        const uniqueObjects = Array.from(new Set(data.objects));
+        nextAlert = `${uniqueObjects.slice(0, 2).join(', ')}${uniqueObjects.length > 2 ? '...' : ''} detected`;
+      }
+
+      if (nextAlert !== lastAlertTextRef.current) {
+        setAlertText(nextAlert);
+        lastAlertTextRef.current = nextAlert;
+      }
+
+      if (nextAlert.includes('Warning')) {
+        Vibration.vibrate([0, 50, 50, 50]);
+      }
+
+      if (data.alert) {
+        speakAlert(data.alert);
+      }
+    },
+    [speakAlert]
+  );
+
+  // ---------- lifecycle / controls ----------
+
   useEffect(() => {
     return () => {
       mountedRef.current = false;
       runningRef.current = false;
+      if (frameLoopTimeoutRef.current) {
+        clearTimeout(frameLoopTimeoutRef.current);
+      }
       Speech.stop();
     };
-  }, []);
-
-  // Auto-start when camera is ready
-  useEffect(() => {
-    if (isCameraReady && !isRunning) {
-      startDetection();
-    }
-  }, [isCameraReady]);
-
-  const startDetection = useCallback(() => {
-    if (runningRef.current) return;
-    
-    runningRef.current = true;
-    setIsRunning(true);
-    setConnectionStatus('connecting');
-    startRealtimeLoop();
   }, []);
 
   const stopDetection = useCallback(() => {
     runningRef.current = false;
     setIsRunning(false);
     Speech.stop();
-    setAlertText('Detection Stopped');
+
+    if (frameLoopTimeoutRef.current) {
+      clearTimeout(frameLoopTimeoutRef.current);
+      frameLoopTimeoutRef.current = null;
+    }
+
+    setAlertText('Paused');
+    lastAlertTextRef.current = 'Paused';
   }, []);
 
-  const toggleDetection = useCallback(() => {
-    if (isRunning) {
-      stopDetection();
-    } else {
-      startDetection();
-    }
-  }, [isRunning, startDetection, stopDetection]);
-
-  const startRealtimeLoop = async () => {
-    const frameDelay = 1000 / CONFIG.FRAME_RATE;
-    
-    while (runningRef.current && mountedRef.current) {
-      const startTime = Date.now();
-      
-      await captureAndSendFrame();
-      
-      // Maintain consistent frame rate
-      const elapsed = Date.now() - startTime;
-      const waitTime = Math.max(0, frameDelay - elapsed);
-      
-      if (waitTime > 0) {
-        await new Promise(resolve => setTimeout(resolve, waitTime));
-      }
-    }
-  };
-
-  const captureAndSendFrame = async () => {
+  const captureAndSendFrame = useCallback(async () => {
     if (!cameraRef.current || processingRef.current || !mountedRef.current) {
       return;
     }
 
     processingRef.current = true;
+    const startTime = Date.now();
 
     try {
-      // Capture photo
       const photo = await cameraRef.current.takePictureAsync({
         quality: CONFIG.IMAGE_QUALITY,
         skipProcessing: true,
         base64: false,
+        exif: false,
       });
 
       if (!mountedRef.current) return;
 
-      // Prepare form data
       const formData = new FormData();
       formData.append('image', {
         uri: Platform.OS === 'ios' ? photo.uri.replace('file://', '') : photo.uri,
@@ -153,15 +221,16 @@ export default function Dashboard() {
         name: 'frame.jpg',
       } as any);
 
-      // Create abort controller for timeout
       const controller = new AbortController();
       const timeoutId = setTimeout(() => controller.abort(), CONFIG.REQUEST_TIMEOUT);
 
-      // Send to server
       const response = await fetch(CONFIG.SERVER_URL, {
         method: 'POST',
         body: formData,
         signal: controller.signal,
+        headers: {
+          'Accept': 'application/json',
+        },
       });
 
       clearTimeout(timeoutId);
@@ -171,273 +240,350 @@ export default function Dashboard() {
       }
 
       const data: ServerResponse = await response.json();
-
       if (!mountedRef.current) return;
 
-      // Update state
-      setDetections(data.detections || []);
+      updateDetections(data.detections || []);
       setServerW(data.frameWidth || 1);
       setServerH(data.frameHeight || 1);
       setConnectionStatus('connected');
-      setFrameCount(prev => prev + 1);
-      retryCountRef.current = 0; // Reset retry count on success
+      retryCountRef.current = 0;
 
-      // Handle alerts
       handleAlerts(data);
-
     } catch (err: any) {
-      console.error('Error sending frame:', err.message);
-      
       if (!mountedRef.current) return;
+      
+      const isNetworkError = err?.message?.includes('Network') || 
+                            err?.message?.includes('Failed to fetch') || 
+                            err?.name === 'AbortError';
+      
+      console.warn('Error sending frame:', err?.message ?? err);
+      
+      if (isNetworkError) {
+        setConnectionStatus('error');
+        retryCountRef.current += 1;
 
-      setConnectionStatus('error');
-      retryCountRef.current++;
-
-      // Stop if max retries reached
-      if (retryCountRef.current >= CONFIG.MAX_RETRY_ATTEMPTS) {
-        setAlertText('Connection lost. Please check server.');
-        stopDetection();
-        
-        Alert.alert(
-          'Connection Error',
-          'Unable to connect to detection server. Please verify the server is running and the IP address is correct.',
-          [{ text: 'OK' }]
-        );
+        if (retryCountRef.current >= CONFIG.MAX_RETRY_ATTEMPTS) {
+          setAlertText('Connection Lost');
+          lastAlertTextRef.current = 'Connection Lost';
+          stopDetection();
+          Alert.alert('Connection Error', 'Unable to reach the AI Server.');
+        } else {
+          if (lastAlertTextRef.current !== 'Reconnecting...') {
+            setAlertText('Reconnecting...');
+            lastAlertTextRef.current = 'Reconnecting...';
+          }
+          await new Promise(resolve => setTimeout(resolve, CONFIG.RECONNECT_DELAY));
+        }
       } else {
-        setAlertText('Reconnecting...');
-        // Wait before retry
-        await new Promise(resolve => setTimeout(resolve, CONFIG.RECONNECT_DELAY));
+        // For non-network errors (like processing errors), just skip this frame
+        // and don't increment retry count or show reconnecting
+        console.warn('Skipping frame due to error:', err?.message);
       }
     } finally {
       processingRef.current = false;
     }
-  };
+  }, [handleAlerts, stopDetection, updateDetections]);
 
-  const handleAlerts = (data: ServerResponse) => {
-    if (data.alert) {
-      setAlertText(data.alert);
+  const startRealtimeLoop = useCallback(() => {
+    const frameDelay = 1000 / CONFIG.FRAME_RATE;
+    const loop = async () => {
+      if (!runningRef.current || !mountedRef.current) return;
       
-      // Vibrate for priority alerts
-      if (data.alert.includes('Warning')) {
-        Vibration.vibrate([0, 200, 100, 200]);
+      await captureAndSendFrame();
+      
+      if (runningRef.current && mountedRef.current) {
+        // Use setImmediate-like behavior for faster loops
+        frameLoopTimeoutRef.current = setTimeout(loop, frameDelay);
       }
-      
-      // Speak alert with cooldown
-      speakAlert(data.alert);
-      
-    } else if (data.objects?.length > 0) {
-      const uniqueObjects = Array.from(new Set(data.objects));
-      setAlertText(`Visible: ${uniqueObjects.join(', ')}`);
+    };
+    loop();
+  }, [captureAndSendFrame]);
+
+  const startDetection = useCallback(() => {
+    if (runningRef.current) return;
+    runningRef.current = true;
+    retryCountRef.current = 0;
+    setIsRunning(true);
+    setConnectionStatus('connecting');
+    setAlertText('Starting AI...');
+    lastAlertTextRef.current = 'Starting AI...';
+    startRealtimeLoop();
+  }, [startRealtimeLoop]);
+
+  const toggleDetection = useCallback(() => {
+    if (isRunning) {
+      stopDetection();
     } else {
-      setAlertText('Path Clear');
+      startDetection();
     }
-  };
+  }, [isRunning, startDetection, stopDetection]);
 
-  const speakAlert = (text: string) => {
-    const now = Date.now();
-    
-    // Cooldown check
-    if (now - lastSpeechTimeRef.current < CONFIG.SPEECH_COOLDOWN) {
-      return;
+  const hasStartedRef = useRef(false);
+
+  useEffect(() => {
+    if (isCameraReady && !hasStartedRef.current) {
+      hasStartedRef.current = true;
+      startDetection();
     }
-    
-    lastSpeechTimeRef.current = now;
-    
-    // Stop any ongoing speech
-    Speech.stop();
-    
-    // Speak the alert
-    Speech.speak(text, {
-      language: 'en-US',
-      pitch: 1.0,
-      rate: 1.1,
-    });
-  };
+  }, [isCameraReady, startDetection]);
 
-  if (!permission) {
+  const { scaleX, scaleY } = useMemo(() => {
+    const w = Math.max(1, serverW);
+    const h = Math.max(1, serverH);
+    return {
+      scaleX: cameraLayout.w / w,
+      scaleY: cameraLayout.h / h,
+    };
+  }, [serverW, serverH, cameraLayout]);
+
+  // ---------- render ----------
+
+  if (!permission || !permission.granted) {
     return (
       <View style={styles.permissionContainer}>
-        <Text style={styles.permissionText}>Loading...</Text>
-      </View>
-    );
-  }
-
-  if (!permission.granted) {
-    return (
-      <View style={styles.permissionContainer}>
-        <Text style={styles.permissionText}>📷 Camera Permission Required</Text>
+        <View style={styles.permissionIconCircle}>
+           <Feather name="camera-off" size={40} color={COLORS.textSub} />
+        </View>
+        <Text style={styles.permissionText}>Camera Access Needed</Text>
         <Text style={styles.permissionSubtext}>
-          This app needs camera access to detect objects and assist navigation.
+          We need access to your camera to detect objects and assist with navigation.
         </Text>
-        <TouchableOpacity style={styles.button} onPress={requestPermission}>
-          <Text style={styles.buttonText}>Grant Permission</Text>
+        <TouchableOpacity style={styles.primaryButton} onPress={requestPermission}>
+          <Text style={styles.primaryButtonText}>Grant Permission</Text>
         </TouchableOpacity>
       </View>
     );
   }
-
-  const scaleX = SCREEN_WIDTH / serverW;
-  const scaleY = SCREEN_HEIGHT / serverH;
 
   return (
     <View style={styles.container}>
-      <CameraView
-        style={styles.camera}
-        facing="back"
-        ref={cameraRef}
-        onCameraReady={() => setIsCameraReady(true)}
-      >
-        <View style={styles.overlay}>
-          {detections.map((det, i) => (
-            <BoundingBox
-              key={`${det.class}-${i}-${frameCount}`}
-              detection={det}
-              scaleX={scaleX}
-              scaleY={scaleY}
-            />
-          ))}
-        </View>
-      </CameraView>
-
-      {/* Status Indicator */}
-      <View style={styles.statusContainer}>
-        <View style={[
-          styles.statusDot,
-          { backgroundColor: connectionStatus === 'connected' ? '#22C55E' : connectionStatus === 'error' ? '#EF4444' : '#F59E0B' }
-        ]} />
-        <Text style={styles.statusText}>
-          {connectionStatus === 'connected' ? 'Connected' : connectionStatus === 'error' ? 'Error' : 'Connecting'}
-        </Text>
-        <Text style={styles.fpsText}>• {CONFIG.FRAME_RATE} FPS</Text>
-      </View>
-
-      {/* Control Buttons */}
-      <View style={styles.controlsContainer}>
-        <TouchableOpacity 
-          style={[styles.controlButton, isRunning ? styles.stopButton : styles.startButton]} 
-          onPress={toggleDetection}
-        >
-          <Text style={styles.controlButtonText}>
-            {isRunning ? '⏸ PAUSE' : '▶ START'}
-          </Text>
-        </TouchableOpacity>
-      </View>
-
-      {/* Alert Box */}
+      <StatusBar barStyle="light-content" backgroundColor={COLORS.bg} />
+      
+      {/* --- Main Camera View --- */}
+      {/* ADJUSTED: flex 3/1 split so list is visible */}
       <View
-        style={[
-          styles.alertBox,
-          {
-            backgroundColor: alertText.includes('Warning')
-              ? 'rgba(220,38,38,0.95)'
-              : alertText.includes('Clear')
-              ? 'rgba(34,197,94,0.9)'
-              : 'rgba(0,0,0,0.85)',
-          },
-        ]}
+        style={styles.cameraContainer}
+        onLayout={e => {
+            const { width, height } = e.nativeEvent.layout;
+            setCameraLayout({ w: width, h: height });
+        }}
       >
-        <Text style={styles.alertText}>{alertText}</Text>
-        {detections.length > 0 && (
-          <Text style={styles.detectionCount}>
-            {detections.length} object{detections.length !== 1 ? 's' : ''} detected
-          </Text>
-        )}
+        <CameraView
+          style={styles.camera}
+          facing="back"
+          ref={cameraRef}
+          onCameraReady={() => setIsCameraReady(true)}
+        >
+          {/* Bounding Boxes Layer */}
+          <View style={styles.overlay}>
+            {detections.map((det, i) => (
+              <BoundingBox
+                key={`${det.class}-${det.bbox.x1}-${i}`}
+                detection={det}
+                scaleX={scaleX}
+                scaleY={scaleY}
+              />
+            ))}
+          </View>
+
+          {/* Floating HUD Header (Controls) */}
+          <SafeAreaView style={styles.headerSafe}>
+            <View style={styles.headerPill}>
+                <View style={styles.statusContainer}>
+                    <View style={[styles.statusDot, { 
+                        backgroundColor: connectionStatus === 'connected' ? COLORS.success : 
+                                         connectionStatus === 'error' ? COLORS.danger : COLORS.warning 
+                    }]} />
+                    <Text style={styles.statusText}>
+                        {connectionStatus === 'connected' ? 'ONLINE' : 
+                         connectionStatus === 'error' ? 'OFFLINE' : 'SYNCING'}
+                    </Text>
+                </View>
+
+                <TouchableOpacity 
+                    style={[styles.actionButton, isRunning ? styles.btnDanger : styles.btnSuccess]} 
+                    onPress={toggleDetection}
+                >
+                    <Feather name={isRunning ? "pause" : "play"} size={18} color="white" />
+                    <Text style={styles.actionButtonText}>{isRunning ? "Pause" : "Start"}</Text>
+                </TouchableOpacity>
+            </View>
+          </SafeAreaView>
+
+          {/* Floating Alert Banner - MOVED DOWN */}
+          {/* ADJUSTED: Moved to bottom of camera view */}
+          <View style={styles.floatingAlertContainer}>
+            <View style={[
+                styles.floatingAlert, 
+                alertText.includes('Warning') && styles.floatingAlertWarning
+            ]}>
+                <Feather 
+                    name={alertText.includes('Warning') ? "alert-triangle" : "activity"} 
+                    size={18} 
+                    color={alertText.includes('Warning') ? COLORS.danger : COLORS.primary} 
+                />
+                <Text style={styles.floatingAlertText}>{alertText}</Text>
+            </View>
+          </View>
+
+        </CameraView>
+      </View>
+
+      {/* --- Bottom Dashboard --- */}
+      {/* ADJUSTED: More space for the list */}
+      <View style={styles.dashboardContainer}>
+        <View style={styles.dashboardHeader}>
+            <View style={styles.dragHandle} />
+            <View style={styles.dashHeaderRow}>
+                <Text style={styles.dashTitle}>Live Detections</Text>
+                <View style={styles.countBadge}>
+                    <Text style={styles.countText}>{detections.length}</Text>
+                </View>
+            </View>
+        </View>
+
+        <FlatList
+          data={detections}
+          keyExtractor={(item, idx) => `${item.class}-${idx}`}
+          contentContainerStyle={styles.listContent}
+          showsVerticalScrollIndicator={false}
+          renderItem={({ item }) => (
+            <View style={[styles.card, item.isPriority && styles.cardPriority]}>
+              <View style={styles.cardIcon}>
+                 <Feather 
+                    name={item.isPriority ? "alert-circle" : "box"} 
+                    size={20} 
+                    color={item.isPriority ? COLORS.danger : COLORS.primary} 
+                 />
+              </View>
+              <View style={styles.cardBody}>
+                <View style={styles.cardTop}>
+                    <Text style={styles.cardTitle}>{item.class}</Text>
+                    <Text style={styles.cardConfidence}>{Math.round(item.confidence * 100)}%</Text>
+                </View>
+                <View style={styles.cardBottom}>
+                    <Text style={styles.cardMeta}>{item.position}</Text>
+                    <Text style={styles.cardDistance}>{item.distance}</Text>
+                </View>
+              </View>
+            </View>
+          )}
+          ListEmptyComponent={
+            <View style={styles.emptyState}>
+              <Feather name="eye-off" size={24} color={COLORS.textSub} style={{ marginBottom: 8 }} />
+              <Text style={styles.emptyText}>No objects in view</Text>
+            </View>
+          }
+        />
       </View>
     </View>
   );
 }
 
-function BoundingBox({
+// Optimized Bounding Box Component
+const BoundingBox = memo(function BoundingBox({
   detection,
   scaleX,
-  scaleY
+  scaleY,
 }: {
   detection: Detection;
   scaleX: number;
   scaleY: number;
 }) {
-  const { bbox, class: className, isPriority, distance, confidence } = detection;
+  const { bbox, class: className, isPriority, confidence } = detection;
+
+  const left = bbox.x1 * scaleX;
+  const top = bbox.y1 * scaleY;
+  const width = (bbox.x2 - bbox.x1) * scaleX;
+  const height = (bbox.y2 - bbox.y1) * scaleY;
+
+  const color = isPriority ? COLORS.danger : COLORS.success;
 
   return (
     <View
-      style={{
-        position: 'absolute',
-        left: bbox.x1 * scaleX,
-        top: bbox.y1 * scaleY,
-        width: (bbox.x2 - bbox.x1) * scaleX,
-        height: (bbox.y2 - bbox.y1) * scaleY,
-        borderWidth: 3,
-        borderColor: isPriority ? '#EF4444' : '#22C55E',
-        borderRadius: 4,
-        zIndex: 10,
-      }}
-    >
-      <View
         style={{
-          backgroundColor: isPriority ? '#EF4444' : '#22C55E',
-          paddingHorizontal: 6,
-          paddingVertical: 2,
-          borderRadius: 4,
+            position: 'absolute',
+            left,
+            top,
+            width,
+            height,
+            borderWidth: 2,
+            borderColor: color,
+            borderRadius: 8,
+            zIndex: 10,
         }}
-      >
-        <Text style={{ color: 'white', fontSize: 11, fontWeight: 'bold' }}>
-          {className}
+    >
+      <View style={{
+          position: 'absolute',
+          top: -24,
+          left: -2,
+          backgroundColor: color,
+          paddingHorizontal: 8,
+          paddingVertical: 4,
+          borderRadius: 6,
+          flexDirection: 'row',
+          alignItems: 'center',
+          gap: 4
+      }}>
+        <Text style={{ color: 'white', fontWeight: 'bold', fontSize: 10 }}>
+            {className.toUpperCase()}
         </Text>
-        <Text style={{ color: 'white', fontSize: 9 }}>
-          {distance} • {Math.round(confidence * 100)}%
+        <Text style={{ color: 'rgba(255,255,255,0.8)', fontSize: 10 }}>
+            {Math.round(confidence * 100)}%
         </Text>
       </View>
     </View>
   );
-}
+});
 
 const styles = StyleSheet.create({
-  container: { 
-    flex: 1, 
-    backgroundColor: 'black' 
-  },
-
-  permissionContainer: {
+  container: {
     flex: 1,
-    justifyContent: 'center',
-    alignItems: 'center',
+    backgroundColor: COLORS.bg,
+  },
+  
+  // Camera Section
+  cameraContainer: {
+    flex: 2, // 60% of screen height (gives 40% to list)
     backgroundColor: '#000',
-    padding: 20,
+    overflow: 'hidden',
+    borderBottomLeftRadius: 32,
+    borderBottomRightRadius: 32,
   },
-  permissionText: { 
-    color: 'white', 
-    fontSize: 20,
-    fontWeight: 'bold',
-    marginBottom: 12,
-    textAlign: 'center',
+  camera: {
+    flex: 1,
   },
-  permissionSubtext: {
-    color: '#9CA3AF',
-    fontSize: 14,
-    textAlign: 'center',
-    marginBottom: 24,
-    lineHeight: 20,
+  overlay: {
+    ...StyleSheet.absoluteFillObject,
   },
 
-  camera: { 
-    flex: 1 
-  },
-
-  overlay: { 
-    ...StyleSheet.absoluteFillObject 
-  },
-
-  statusContainer: {
+  // Floating Header
+  headerSafe: {
     position: 'absolute',
-    top: 50,
-    left: 20,
+    top: 0,
+    left: 0,
+    right: 0,
+    zIndex: 20,
+  },
+  headerPill: {
+    marginHorizontal: 16,
+    marginTop: Platform.OS === 'android' ? 40 : 10,
     flexDirection: 'row',
     alignItems: 'center',
-    backgroundColor: 'rgba(0,0,0,0.7)',
-    paddingHorizontal: 12,
-    paddingVertical: 8,
-    borderRadius: 20,
-    zIndex: 20,
+    justifyContent: 'space-between',
+    backgroundColor: 'rgba(26, 31, 46, 0.95)',
+    borderRadius: 50,
+    padding: 6,
+    paddingLeft: 16,
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 12,
+    elevation: 8,
+  },
+  statusContainer: {
+    flexDirection: 'row',
+    alignItems: 'center',
   },
   statusDot: {
     width: 8,
@@ -446,75 +592,215 @@ const styles = StyleSheet.create({
     marginRight: 8,
   },
   statusText: {
-    color: 'white',
+    color: COLORS.textMain,
     fontSize: 12,
-    fontWeight: '600',
+    fontWeight: '700',
+    letterSpacing: 0.5,
   },
-  fpsText: {
-    color: '#9CA3AF',
+  actionButton: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    paddingVertical: 8,
+    paddingHorizontal: 16,
+    borderRadius: 40,
+  },
+  btnSuccess: { backgroundColor: COLORS.primary },
+  btnDanger: { backgroundColor: COLORS.danger },
+  actionButtonText: {
+    color: 'white',
+    fontWeight: '700',
     fontSize: 12,
-    marginLeft: 4,
+    marginLeft: 6,
   },
 
-  controlsContainer: {
+  // Floating Alert - UPDATED
+  floatingAlertContainer: {
     position: 'absolute',
-    top: 50,
-    right: 20,
-    zIndex: 20,
+    bottom: 20, // Sticks to the bottom of the Camera View
+    left: 0,
+    right: 0,
+    alignItems: 'center',
+    zIndex: 15,
   },
-  controlButton: {
-    paddingHorizontal: 20,
+  floatingAlert: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    backgroundColor: 'rgba(26, 31, 46, 0.98)',
     paddingVertical: 12,
-    borderRadius: 25,
-    elevation: 5,
+    paddingHorizontal: 20,
+    borderRadius: 30,
+    gap: 8,
     shadowColor: '#000',
-    shadowOffset: { width: 0, height: 2 },
-    shadowOpacity: 0.3,
-    shadowRadius: 4,
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.4,
+    shadowRadius: 12,
+    elevation: 10,
   },
-  startButton: {
-    backgroundColor: '#22C55E',
+  floatingAlertWarning: {
+    backgroundColor: 'rgba(239, 68, 68, 0.2)',
   },
-  stopButton: {
-    backgroundColor: '#EF4444',
-  },
-  controlButtonText: {
-    color: 'white',
-    fontWeight: 'bold',
+  floatingAlertText: {
+    color: COLORS.textMain,
+    fontWeight: '600',
     fontSize: 14,
   },
 
-  alertBox: {
-    position: 'absolute',
-    bottom: 0,
-    width: '100%',
-    padding: 24,
-    paddingBottom: 40,
+  // Dashboard / Bottom Sheet
+  dashboardContainer: {
+    flex: 1.3, // 40% of screen height - more space for cards
+    backgroundColor: COLORS.bg,
+    paddingHorizontal: 16,
+    paddingTop: 12,
+  },
+  dashboardHeader: {
+    marginBottom: 12,
     alignItems: 'center',
   },
-  alertText: {
-    color: 'white',
-    fontSize: 20,
-    fontWeight: 'bold',
-    textAlign: 'center',
-    marginBottom: 4,
+  dragHandle: {
+    width: 40,
+    height: 4,
+    backgroundColor: COLORS.border,
+    borderRadius: 2,
+    marginBottom: 12,
   },
-  detectionCount: {
-    color: '#D1D5DB',
-    fontSize: 12,
-    marginTop: 4,
+  dashHeaderRow: {
+    flexDirection: 'row',
+    width: '100%',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+  },
+  dashTitle: {
+    color: COLORS.textMain,
+    fontSize: 16,
+    fontWeight: 'bold',
+  },
+  countBadge: {
+    backgroundColor: '#1E3A8A',
+    paddingHorizontal: 10,
+    paddingVertical: 3,
+    borderRadius: 10,
+  },
+  countText: {
+    color: COLORS.primary,
+    fontWeight: 'bold',
   },
 
-  button: { 
-    backgroundColor: '#3B82F6', 
-    paddingHorizontal: 24,
-    paddingVertical: 12, 
-    borderRadius: 12,
-    elevation: 3,
+  // List Items
+  listContent: {
+    paddingBottom: 16,
   },
-  buttonText: { 
-    color: 'white', 
+  card: {
+    flexDirection: 'row',
+    backgroundColor: COLORS.card,
+    borderRadius: 14,
+    padding: 12,
+    marginBottom: 8,
+    alignItems: 'center',
+    shadowColor: '#000',
+    shadowOffset: { width: 0, height: 2 },
+    shadowOpacity: 0.3,
+    shadowRadius: 6,
+    elevation: 4,
+  },
+  cardPriority: {
+    borderLeftWidth: 3,
+    borderLeftColor: COLORS.danger,
+    backgroundColor: '#2A1A1E',
+  },
+  cardIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: 10,
+    backgroundColor: '#252A3A',
+    alignItems: 'center',
+    justifyContent: 'center',
+    marginRight: 10,
+  },
+  cardBody: {
+    flex: 1,
+  },
+  cardTop: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    marginBottom: 4,
+  },
+  cardTitle: {
+    color: COLORS.textMain,
+    fontWeight: '600',
+    fontSize: 15,
+  },
+  cardConfidence: {
+    color: COLORS.success,
+    fontWeight: '700',
+    fontSize: 12,
+  },
+  cardBottom: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+  },
+  cardMeta: {
+    color: COLORS.textSub,
+    fontSize: 12,
+  },
+  cardDistance: {
+    color: COLORS.textSub,
+    fontSize: 12,
+    fontVariant: ['tabular-nums'],
+  },
+  emptyState: {
+    alignItems: 'center',
+    marginTop: 20,
+    opacity: 0.5,
+  },
+  emptyText: {
+    color: COLORS.textSub,
+  },
+
+  // Permission Screen
+  permissionContainer: {
+    flex: 1,
+    justifyContent: 'center',
+    alignItems: 'center',
+    backgroundColor: COLORS.bg,
+    padding: 30,
+  },
+  permissionIconCircle: {
+      width: 80,
+      height: 80,
+      borderRadius: 40,
+      backgroundColor: COLORS.card,
+      alignItems: 'center',
+      justifyContent: 'center',
+      marginBottom: 20,
+  },
+  permissionText: {
+    color: COLORS.textMain,
+    fontSize: 22,
     fontWeight: 'bold',
+    marginBottom: 10,
+  },
+  permissionSubtext: {
+    color: COLORS.textSub,
+    textAlign: 'center',
+    marginBottom: 30,
+    lineHeight: 22,
+  },
+  primaryButton: {
+    backgroundColor: COLORS.primary,
+    paddingHorizontal: 24,
+    paddingVertical: 14,
+    borderRadius: 14,
+    width: '100%',
+    alignItems: 'center',
+    shadowColor: COLORS.primary,
+    shadowOffset: { width: 0, height: 4 },
+    shadowOpacity: 0.3,
+    shadowRadius: 8,
+    elevation: 5,
+  },
+  primaryButtonText: {
+    color: '#FFFFFF',
+    fontWeight: '700',
     fontSize: 16,
   },
 });
